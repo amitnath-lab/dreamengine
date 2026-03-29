@@ -2,15 +2,17 @@
 Claude Opus supervisor – the brain of the pipeline.
 
 Responsibilities:
-  1. Plan which agents to activate for a phase and what each should do
-  2. Pick the best (cheapest viable) Ollama model for each agent task
-  3. Issue quality-gate verdicts between phases
+  1. Decompose a project brief into parallel features
+  2. Plan which agents to activate for a phase+feature
+  3. Pick the cheapest viable Ollama model for each task
+  4. Issue quality-gate verdicts between phases
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from .agents import AgentSpec, agents_for_phase
@@ -22,12 +24,12 @@ from .config import (
     PipelineConfig,
 )
 from .models import call_model, get_supervisor_model, pick_model
-from .state import AgentResult, GateVerdict, PipelineState
+from .state import AgentResult, Feature, GateVerdict, PipelineState
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# System prompt for the supervisor
+# Shared system prompt
 # ---------------------------------------------------------------------------
 
 SUPERVISOR_SYSTEM = """\
@@ -36,118 +38,180 @@ AI development pipeline.  You are Claude Opus — the most capable model in
 the pipeline — and your job is to *direct*, not to *do*.
 
 ## Your responsibilities
-1. **Phase planning** – Given a project brief, the current phase, and the
-   available agents, produce a concrete plan: which agents to activate, what
-   task each should perform, and in what order (or which can run in parallel).
-2. **Model routing** – For every agent task, recommend the cheapest Ollama
-   model tier that can handle the job.  Only escalate to heavier models when
-   the task genuinely requires deeper reasoning or larger context.
-3. **Quality gating** – After a phase completes, review the collected outputs
-   and decide whether the phase passes.  Be evidence-based: require concrete
-   artefacts, not vague assertions.
+1. **Feature decomposition** – Break a project brief into independent,
+   parallelisable features with clear boundaries and dependency ordering.
+2. **Phase planning** – For each phase+feature, decide which agents to
+   activate, what each should do, and which can run in parallel.
+3. **Model routing** – For every agent task, recommend the cheapest Ollama
+   model tier that can handle the job.
+4. **Quality gating** – After a phase completes, review the collected
+   outputs and decide pass/fail.  Require evidence, not assertions.
 
-## Model tiers available (cheapest first)
+## Model tiers (cheapest first — ALWAYS prefer free_fast)
 - **free_fast**: qwen2.5:7b, llama3.1:8b, gemma2:9b, phi3:mini, deepseek-coder-v2:16b
 - **free_medium**: qwen2.5:32b, llama3.1:70b
 - **free_heavy**: deepseek-coder-v2:236b, mixtral:8x22b
 
-Always prefer free_fast.  Use free_medium only for complex architecture,
-security, or deep analysis.  Use free_heavy only as a last resort.
-
 ## Output format
-Always respond with **valid JSON** (no markdown fences, no commentary).
+Always respond with **valid JSON only** — no markdown fences, no commentary.
 """
 
 
-# ---------------------------------------------------------------------------
-# Plan a phase
-# ---------------------------------------------------------------------------
-
-def plan_phase(
-    state: PipelineState,
-    phase: str,
-    available_agents: list[AgentSpec],
-    config: PipelineConfig,
-) -> list[dict[str, Any]]:
-    """
-    Ask the supervisor to plan the work for *phase*.
-    Returns a list of task dicts:
-        [{"agent": "...", "task": "...", "recommended_tier": "free_fast"}, ...]
-    """
-    supervisor_model = get_supervisor_model(config.models)
-
-    agent_summaries = "\n".join(
-        f"- **{a.name}** ({a.division}): {a.description}"
-        for a in available_agents
-    )
-
-    # Include prior phase outputs as context
-    prior = [r for r in state.get("results", []) if r.get("status") == "success"]
-    prior_summary = "\n".join(
-        f"- [{r['agent_name']}] {r['output'][:200]}..."
-        for r in prior[-10:]  # last 10 results for context window economy
-    ) or "(no prior outputs)"
-
-    prompt = f"""\
-PROJECT BRIEF:
-{state["project_brief"]}
-
-CURRENT PHASE: {phase}
-
-AVAILABLE AGENTS FOR THIS PHASE:
-{agent_summaries}
-
-PRIOR PHASE OUTPUTS (summary):
-{prior_summary}
-
-Produce a JSON array of tasks for this phase.  Each element:
-{{
-  "agent": "<agent name>",
-  "task": "<specific instruction for this agent>",
-  "recommended_tier": "free_fast" | "free_medium" | "free_heavy",
-  "parallel_group": <int>   // tasks with the same group number can run in parallel
-}}
-
-Prioritise free_fast models.  Only escalate when the task genuinely requires it.
-Return ONLY the JSON array."""
-
-    raw = call_model(supervisor_model, SUPERVISOR_SYSTEM, prompt, config, max_tokens=4096)
-
-    # Parse – strip markdown fences if the model wraps them
+def _parse_json(raw: str) -> Any:
+    """Best-effort JSON parse from LLM output."""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
     if raw.endswith("```"):
         raw = raw.rsplit("```", 1)[0]
     raw = raw.strip()
+    if raw.startswith("json"):
+        raw = raw[4:].strip()
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# 1. Feature decomposition
+# ---------------------------------------------------------------------------
+
+def decompose_features(
+    project_brief: str,
+    config: PipelineConfig,
+) -> list[Feature]:
+    """
+    Ask the supervisor to break the brief into parallel features.
+    """
+    supervisor = get_supervisor_model(config.models)
+
+    prompt = f"""\
+PROJECT BRIEF:
+{project_brief}
+
+Decompose this project into independent, parallelisable features.
+Each feature should be a discrete unit of work that can be built, tested,
+and shipped independently.  Identify dependencies between features.
+
+Return a JSON array:
+[
+  {{
+    "id": "short-slug",
+    "title": "Human-readable title",
+    "description": "What this feature includes",
+    "priority": 1,
+    "depends_on": ["other-feature-id"]
+  }}
+]
+
+Order by priority (1 = highest).  Features with no dependencies can be built
+in parallel.  Return ONLY the JSON array."""
+
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=4096)
 
     try:
-        plan = json.loads(raw)
-    except json.JSONDecodeError:
-        log.warning("Supervisor returned non-JSON plan, falling back to simple plan")
+        items = _parse_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        log.warning("Supervisor returned unparseable feature list — using single feature")
+        items = [{"id": "main", "title": "Full Project", "description": project_brief,
+                  "priority": 1, "depends_on": []}]
+
+    features: list[Feature] = []
+    for item in items:
+        features.append(Feature(
+            id=item["id"],
+            title=item.get("title", item["id"]),
+            description=item.get("description", ""),
+            priority=item.get("priority", len(features) + 1),
+            status="pending",
+            current_phase="",
+            depends_on=item.get("depends_on", []),
+        ))
+    return features
+
+
+# ---------------------------------------------------------------------------
+# 2. Phase planning (per feature)
+# ---------------------------------------------------------------------------
+
+def plan_phase(
+    state: PipelineState,
+    phase: str,
+    feature: Feature,
+    available_agents: list[AgentSpec],
+    config: PipelineConfig,
+) -> list[dict[str, Any]]:
+    """
+    Ask the supervisor to plan work for a specific phase + feature.
+    Returns task dicts: [{"agent": "...", "task": "...", "recommended_tier": "..."}, ...]
+    """
+    supervisor = get_supervisor_model(config.models)
+
+    agent_summaries = "\n".join(
+        f"- **{a.name}** ({a.division}): {a.description}"
+        for a in available_agents
+    )
+
+    # Prior results for this feature
+    prior = [r for r in state.get("results", [])
+             if r.get("feature_id") == feature["id"] and r.get("status") == "success"]
+    prior_summary = "\n".join(
+        f"- [{r['agent_name']}] {r['output'][:200]}..."
+        for r in prior[-8:]
+    ) or "(no prior outputs for this feature)"
+
+    prompt = f"""\
+PROJECT BRIEF:
+{state["project_brief"][:500]}
+
+FEATURE: {feature["title"]}
+{feature["description"]}
+
+CURRENT PHASE: {phase}
+
+AVAILABLE AGENTS:
+{agent_summaries}
+
+PRIOR OUTPUTS FOR THIS FEATURE:
+{prior_summary}
+
+Produce a JSON array of tasks.  Each element:
+{{
+  "agent": "<agent name>",
+  "task": "<specific instruction>",
+  "recommended_tier": "free_fast" | "free_medium" | "free_heavy",
+  "parallel_group": <int>
+}}
+
+Prioritise free_fast.  Return ONLY the JSON array."""
+
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=4096)
+
+    try:
+        plan = _parse_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        log.warning("Supervisor plan parse failed — using default plan")
         plan = [
-            {"agent": a.name, "task": f"Perform your core function for the {phase} phase.",
+            {"agent": a.name, "task": f"Perform {phase} work for feature: {feature['title']}",
              "recommended_tier": "free_fast", "parallel_group": 0}
-            for a in available_agents
+            for a in available_agents[:5]  # cap to avoid overwhelming
         ]
     return plan
 
 
 # ---------------------------------------------------------------------------
-# Quality gate
+# 3. Quality gate
 # ---------------------------------------------------------------------------
 
 def quality_gate(
     state: PipelineState,
     phase: str,
+    feature: Feature,
     config: PipelineConfig,
 ) -> GateVerdict:
-    """
-    Ask the supervisor to review all results for *phase* and issue a verdict.
-    """
-    supervisor_model = get_supervisor_model(config.models)
+    """Review results for a phase+feature and issue pass/fail."""
+    supervisor = get_supervisor_model(config.models)
 
-    phase_results = [r for r in state.get("results", []) if r.get("phase") == phase]
+    phase_results = [r for r in state.get("results", [])
+                     if r.get("phase") == phase and r.get("feature_id") == feature["id"]]
     results_text = "\n\n".join(
         f"### {r['agent_name']} (model: {r['model_used']}, status: {r['status']})\n{r['output'][:500]}"
         for r in phase_results
@@ -155,39 +219,35 @@ def quality_gate(
 
     prompt = f"""\
 PHASE: {phase}
-PROJECT BRIEF: {state["project_brief"][:500]}
+FEATURE: {feature["title"]}
+PROJECT BRIEF: {state["project_brief"][:300]}
 
 PHASE RESULTS:
 {results_text}
 
-Review these results and decide whether the phase passes the quality gate.
-Reply with a JSON object:
-{{
-  "passed": true | false,
-  "reason": "<1-2 sentence explanation>"
-}}
+Review and decide pass/fail.  Reply with JSON:
+{{"passed": true|false, "reason": "<1-2 sentences>"}}
 Return ONLY the JSON object."""
 
-    raw = call_model(supervisor_model, SUPERVISOR_SYSTEM, prompt, config, max_tokens=512)
-    raw = raw.strip().strip("`").strip()
-    if raw.startswith("json"):
-        raw = raw[4:].strip()
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=512)
 
     try:
-        verdict = json.loads(raw)
-    except json.JSONDecodeError:
-        verdict = {"passed": True, "reason": "Supervisor response unparseable; defaulting to pass."}
+        verdict = _parse_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        verdict = {"passed": True, "reason": "Parse failed; defaulting to pass."}
 
     return GateVerdict(
         phase=phase,
+        feature_id=feature["id"],
         passed=verdict.get("passed", True),
         reason=verdict.get("reason", ""),
-        reviewed_by=supervisor_model.name,
+        reviewed_by=supervisor.name,
+        timestamp=time.time(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Model selection (supervisor-informed)
+# 4. Model selection
 # ---------------------------------------------------------------------------
 
 def select_model_for_task(
@@ -195,18 +255,7 @@ def select_model_for_task(
     recommended_tier: str,
     config: PipelineConfig,
 ) -> ModelSpec:
-    """
-    Resolve the supervisor's tier recommendation to a concrete ModelSpec.
-    Picks the best-fit model within that tier based on task-type strengths.
-    """
     tier_map = {t.value: t for t in ModelTier}
     max_tier = tier_map.get(recommended_tier, ModelTier.FREE_FAST)
-
     task_type = AGENT_TASK_TYPE.get(agent_name, "general")
-
-    return pick_model(
-        task_type,
-        TASK_STRENGTH_MAP,
-        config.models,
-        max_tier=max_tier,
-    )
+    return pick_model(task_type, TASK_STRENGTH_MAP, config.models, max_tier=max_tier)
