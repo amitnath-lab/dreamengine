@@ -24,7 +24,7 @@ Usage:
   # Diagnostics
   python -m pipeline --list-agents
   python -m pipeline --list-models
-  python -m pipeline --check-ollama
+  python -m pipeline --check-bedrock
 """
 
 from __future__ import annotations
@@ -54,26 +54,25 @@ log = logging.getLogger(__name__)
 # Diagnostic commands
 # ---------------------------------------------------------------------------
 
-def check_ollama(config: PipelineConfig) -> None:
-    import httpx
-    print(f"Checking Ollama at {config.ollama_base_url} ...")
+def check_bedrock(config: PipelineConfig) -> None:
+    import boto3
+    print(f"Checking AWS Bedrock in {config.aws_bedrock_region} ...")
     try:
-        resp = httpx.get(f"{config.ollama_base_url}/api/tags", timeout=10.0)
-        resp.raise_for_status()
-        models = resp.json().get("models", [])
-        available = {m["name"] for m in models}
-        print(f"  OK: {len(models)} models available\n")
+        client = boto3.client("bedrock", region_name=config.aws_bedrock_region)
+        resp = client.list_foundation_models()
+        available = {m["modelId"] for m in resp.get("modelSummaries", [])}
+        print(f"  OK: {len(available)} foundation models available\n")
         for spec in config.models:
-            if spec.provider != "ollama":
+            if spec.provider != "bedrock":
                 continue
-            base = spec.name.split(":")[0]
-            found = any(base in m for m in available)
+            found = spec.name in available
             icon = "OK" if found else "MISSING"
-            extra = "" if found else f"  <- ollama pull {spec.name}"
+            extra = "" if found else "  <- enable in Bedrock console"
             print(f"  [{icon:7s}] {spec.name:30s} ({spec.tier.value}){extra}")
     except Exception as e:
         print(f"  FAILED: {e}")
-        print(f"  Start Ollama with: ollama serve")
+        print(f"  Configure AWS credentials: aws configure")
+        print(f"  Ensure Bedrock access is enabled in {config.aws_bedrock_region}")
         sys.exit(1)
 
 
@@ -314,7 +313,7 @@ Examples:
   python -m pipeline --resume run-a1b2c3d4
   python -m pipeline --status run-a1b2c3d4
   python -m pipeline --list-runs
-  python -m pipeline --check-ollama
+  python -m pipeline --check-bedrock
 """,
     )
 
@@ -330,11 +329,11 @@ Examples:
     inspect_group.add_argument("--list-runs", action="store_true", help="List all runs")
     inspect_group.add_argument("--list-agents", action="store_true", help="List agents by phase")
     inspect_group.add_argument("--list-models", action="store_true", help="List model tiers")
-    inspect_group.add_argument("--check-ollama", action="store_true", help="Check Ollama status")
+    inspect_group.add_argument("--check-bedrock", action="store_true", help="Check AWS Bedrock status")
 
     # Config
     cfg_group = parser.add_argument_group("Config")
-    cfg_group.add_argument("--ollama-url", type=str, help="Ollama base URL")
+    cfg_group.add_argument("--bedrock-region", type=str, help="AWS Bedrock region")
     cfg_group.add_argument("--db-path", type=str, default=DEFAULT_DB_PATH, help="Checkpoint DB path")
     cfg_group.add_argument("--verbose", action="store_true", help="Debug logging")
     cfg_group.add_argument("--output", type=str, help="Save final state to JSON file")
@@ -347,12 +346,12 @@ Examples:
     )
 
     config = PipelineConfig(agent_specs_root=REPO_ROOT)
-    if args.ollama_url:
-        config.ollama_base_url = args.ollama_url
+    if args.bedrock_region:
+        config.aws_bedrock_region = args.bedrock_region
 
     # --- Diagnostic commands ---
-    if args.check_ollama:
-        check_ollama(config)
+    if args.check_bedrock:
+        check_bedrock(config)
         return
     if args.list_agents:
         list_agents(config)
@@ -392,7 +391,7 @@ Examples:
 
     print("\n  DreamEngine NEXUS Pipeline")
     print(f"  Repo:    {REPO_ROOT}")
-    print(f"  Ollama:  {config.ollama_base_url}")
+    print(f"  Bedrock: {config.aws_bedrock_region}")
     print(f"  DB:      {args.db_path}")
 
     final = run_pipeline(brief, config, db_path=args.db_path)

@@ -30,14 +30,14 @@ Orchestrates all 150+ DreamEngine agent specs through a 7-phase NEXUS workflow.
            │ (gate fails)
            └──► HALT  (resume later with --resume)
            │
-     ┌─────┴─────┐
-     │   Ollama   │  (local workers — free models)
-     │            │
-     │  qwen2.5   │  ← fast tier (most tasks)
-     │  llama3.1  │  ← fast tier
-     │  deepseek  │  ← code tasks
-     │  mixtral   │  ← heavy tier (rare)
-     └───────────┘
+     ┌─────┴──────────┐
+     │  AWS Bedrock    │  (foundation models — pay per token)
+     │                 │
+     │  Nova Micro     │  ← fast tier (most tasks)
+     │  Nova Lite      │  ← fast tier
+     │  Claude Haiku   │  ← medium tier
+     │  Claude Sonnet  │  ← heavy tier (rare)
+     └────────────────┘
 ```
 
 ## Key Capabilities
@@ -47,7 +47,7 @@ Orchestrates all 150+ DreamEngine agent specs through a 7-phase NEXUS workflow.
 | **Parallel features** | Supervisor decomposes brief into independent features; all execute concurrently within each phase via `asyncio` |
 | **Durable / long-lived** | SQLite checkpointing after every node — crash, close terminal, come back tomorrow |
 | **Resumable** | `--resume run-id` picks up exactly where it stopped |
-| **Model routing** | Supervisor picks cheapest viable Ollama model per task; free_fast handles ~80% |
+| **Model routing** | Supervisor picks cheapest viable Bedrock model per task; fast tier handles ~80% |
 | **Quality gates** | Supervisor reviews every phase; failed gate halts pipeline (resume after fixing) |
 | **130+ agent personas** | Full DreamEngine specs used as system prompts |
 
@@ -55,9 +55,9 @@ Orchestrates all 150+ DreamEngine agent specs through a 7-phase NEXUS workflow.
 
 | Tier | Models | Used For |
 |------|--------|----------|
-| `free_fast` | qwen2.5:7b, llama3.1:8b, gemma2:9b, phi3:mini, deepseek-coder-v2:16b | ~80% of tasks |
-| `free_medium` | qwen2.5:32b, llama3.1:70b | Complex architecture, deep analysis |
-| `free_heavy` | deepseek-coder-v2:236b, mixtral:8x22b | Security audits, heavy reasoning |
+| `free_fast` | amazon.nova-micro-v1:0, amazon.nova-lite-v1:0, mistral-small, llama3.1-8b | ~80% of tasks |
+| `free_medium` | claude-3.5-haiku, amazon.nova-pro-v1:0, llama3.1-70b | Complex architecture, deep analysis |
+| `free_heavy` | claude-sonnet-4, mistral-large | Security audits, heavy reasoning |
 | `paid_supervisor` | claude-opus-4-6 | Orchestration decisions only |
 
 ## Setup
@@ -66,16 +66,18 @@ Orchestrates all 150+ DreamEngine agent specs through a 7-phase NEXUS workflow.
 # 1. Install
 pip install -r pipeline/requirements.txt
 
-# 2. Pull Ollama models (at minimum the fast tier)
-ollama pull qwen2.5:7b
-ollama pull llama3.1:8b
-ollama pull deepseek-coder-v2:16b
+# 2. Configure AWS credentials (for Bedrock access)
+aws configure
+# Or set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BEDROCK_REGION
 
-# 3. Set supervisor API key
+# 3. Enable models in the AWS Bedrock console
+# Go to AWS Console → Bedrock → Model access → Enable the models listed above
+
+# 4. Set supervisor API key
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# 4. Verify
-python -m pipeline --check-ollama
+# 5. Verify
+python -m pipeline --check-bedrock
 ```
 
 ## Usage
@@ -104,7 +106,7 @@ python -m pipeline --brief "..." --verbose
 # --- Diagnostics ---
 python -m pipeline --list-agents    # All 130+ agents by phase
 python -m pipeline --list-models    # Model tier config
-python -m pipeline --check-ollama   # Verify connectivity + pulled models
+python -m pipeline --check-bedrock  # Verify connectivity + enabled models
 ```
 
 ## Pipeline Phases (NEXUS)
@@ -135,7 +137,9 @@ python -m pipeline --check-ollama   # Verify connectivity + pulled models
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | (required) | Claude Opus supervisor |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
+| `AWS_BEDROCK_REGION` | `us-east-1` | AWS Bedrock region |
+| `AWS_ACCESS_KEY_ID` | (from aws configure) | AWS credentials |
+| `AWS_SECRET_ACCESS_KEY` | (from aws configure) | AWS credentials |
 | `--db-path` | `.nexus-pipeline/checkpoints.db` | Checkpoint database |
 
 Edit [config.py](config.py) to add/remove models or adjust task-strength mappings.
@@ -150,8 +154,8 @@ pipeline/
 ├── config.py            # Model tiers, task→strength maps, agent→task maps
 ├── state.py             # LangGraph state: features, results, gates, run identity
 ├── agents.py            # Loads 130+ agent specs, maps to NEXUS phases
-├── models.py            # Sync + async Ollama/Anthropic clients, model picker
+├── models.py            # Sync + async Bedrock/Anthropic clients, model picker
 ├── supervisor.py        # Claude Opus: decompose, plan, gate, route
 ├── graph.py             # LangGraph FSM: 16 nodes, SQLite checkpointer
-└── requirements.txt     # langgraph, langgraph-checkpoint-sqlite, httpx
+└── requirements.txt     # langgraph, langgraph-checkpoint-sqlite, httpx, boto3
 ```

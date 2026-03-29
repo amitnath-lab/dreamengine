@@ -1,8 +1,8 @@
 """
 Model configuration and tier definitions.
 
-Claude Opus supervises. Ollama models do the work.
-Free/fast models are preferred; heavier models are used only when the
+Claude Opus supervises. AWS Bedrock models do the work.
+Cheap/fast models are preferred; heavier models are used only when the
 supervisor decides the task warrants it.
 """
 
@@ -28,89 +28,91 @@ class ModelTier(str, Enum):
 @dataclass(frozen=True)
 class ModelSpec:
     """A single model available in the pipeline."""
-    name: str                 # Ollama model tag or Anthropic model id
+    name: str                 # Bedrock model ID or Anthropic model id
     tier: ModelTier
-    provider: str             # "ollama" | "anthropic"
+    provider: str             # "bedrock" | "anthropic"
     context_window: int = 8192
     strengths: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
-# Default model catalogue – edit to match what you have pulled in Ollama
+# Default model catalogue – uses AWS Bedrock foundation models
 # ---------------------------------------------------------------------------
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+AWS_BEDROCK_REGION = os.getenv("AWS_BEDROCK_REGION", "us-east-1")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 DEFAULT_MODELS: list[ModelSpec] = [
-    # --- Free / Fast (< 10 B params, snappy on consumer GPU) ---
+    # --- Fast (cheap, low-latency Bedrock models) ---
     ModelSpec(
-        name="qwen2.5:7b",
+        name="amazon.nova-micro-v1:0",
         tier=ModelTier.FREE_FAST,
-        provider="ollama",
-        context_window=32768,
+        provider="bedrock",
+        context_window=128000,
         strengths=("code", "general", "planning", "fast"),
     ),
     ModelSpec(
-        name="llama3.1:8b",
+        name="amazon.nova-lite-v1:0",
         tier=ModelTier.FREE_FAST,
-        provider="ollama",
-        context_window=131072,
+        provider="bedrock",
+        context_window=300000,
         strengths=("general", "reasoning", "content"),
     ),
     ModelSpec(
-        name="gemma2:9b",
+        name="mistral.mistral-small-2402-v1:0",
         tier=ModelTier.FREE_FAST,
-        provider="ollama",
-        context_window=8192,
-        strengths=("general", "content", "summarisation"),
-    ),
-    ModelSpec(
-        name="phi3:mini",
-        tier=ModelTier.FREE_FAST,
-        provider="ollama",
-        context_window=4096,
+        provider="bedrock",
+        context_window=32768,
         strengths=("code", "math", "reasoning"),
     ),
     ModelSpec(
-        name="deepseek-coder-v2:16b",
+        name="meta.llama3-1-8b-instruct-v1:0",
         tier=ModelTier.FREE_FAST,
-        provider="ollama",
-        context_window=65536,
-        strengths=("code", "debugging", "architecture"),
+        provider="bedrock",
+        context_window=131072,
+        strengths=("code", "debugging", "fast"),
     ),
 
-    # --- Free / Medium (larger, better quality, slower) ---
+    # --- Medium (higher quality, moderate cost) ---
     ModelSpec(
-        name="qwen2.5:32b",
+        name="anthropic.claude-3-5-haiku-20241022-v1:0",
         tier=ModelTier.FREE_MEDIUM,
-        provider="ollama",
-        context_window=32768,
+        provider="bedrock",
+        context_window=200000,
         strengths=("code", "analysis", "planning", "architecture"),
     ),
     ModelSpec(
-        name="llama3.1:70b",
+        name="amazon.nova-pro-v1:0",
         tier=ModelTier.FREE_MEDIUM,
-        provider="ollama",
+        provider="bedrock",
+        context_window=300000,
+        strengths=("general", "reasoning", "content", "summarisation"),
+    ),
+    ModelSpec(
+        name="meta.llama3-1-70b-instruct-v1:0",
+        tier=ModelTier.FREE_MEDIUM,
+        provider="bedrock",
         context_window=131072,
         strengths=("reasoning", "strategy", "content", "analysis"),
     ),
+
+    # --- Heavy (strongest Bedrock models, higher cost) ---
     ModelSpec(
-        name="deepseek-coder-v2:236b",
+        name="anthropic.claude-sonnet-4-20250514-v1:0",
         tier=ModelTier.FREE_HEAVY,
-        provider="ollama",
-        context_window=65536,
+        provider="bedrock",
+        context_window=200000,
         strengths=("code", "architecture", "security", "review"),
     ),
     ModelSpec(
-        name="mixtral:8x22b",
+        name="mistral.mistral-large-2407-v1:0",
         tier=ModelTier.FREE_HEAVY,
-        provider="ollama",
-        context_window=65536,
+        provider="bedrock",
+        context_window=131072,
         strengths=("general", "reasoning", "multilingual", "content"),
     ),
 
-    # --- Paid / Supervisor – only used for orchestration decisions ---
+    # --- Supervisor – only used for orchestration decisions ---
     ModelSpec(
         name="claude-opus-4-6",
         tier=ModelTier.PAID_SUPERVISOR,
@@ -264,7 +266,7 @@ AGENT_TASK_TYPE: dict[str, str] = {
 class PipelineConfig:
     """Runtime configuration for the pipeline."""
     models: list[ModelSpec] = field(default_factory=lambda: list(DEFAULT_MODELS))
-    ollama_base_url: str = OLLAMA_BASE_URL
+    aws_bedrock_region: str = AWS_BEDROCK_REGION
     anthropic_api_key: str = ANTHROPIC_API_KEY
     agent_specs_root: str = ""  # set to repo root at startup
     max_retries: int = 3
