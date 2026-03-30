@@ -1,13 +1,15 @@
 """
-Unified model client – sync + async – talks to Ollama and Anthropic.
+Unified model client – sync + async – talks to AWS Bedrock and Anthropic.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from functools import lru_cache
 from typing import Any
 
+import boto3
 import httpx
 
 from .config import ModelSpec, ModelTier, PipelineConfig
@@ -16,26 +18,44 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Sync clients  (used by simple paths / fallback)
+# Bedrock client helpers
 # ---------------------------------------------------------------------------
 
-def _ollama_chat(
-    model: str, system: str, user_prompt: str, *,
-    base_url: str, temperature: float = 0.4, max_tokens: int = 4096,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=600.0)
-    resp.raise_for_status()
-    return resp.json().get("message", {}).get("content", "")
+@lru_cache(maxsize=4)
+def _get_bedrock_client(region: str):
+    return boto3.client("bedrock-runtime", region_name=region)
 
+
+def _bedrock_chat(
+    model: str, system: str, user_prompt: str, *,
+    region: str, temperature: float = 0.4, max_tokens: int = 4096,
+) -> str:
+    client = _get_bedrock_client(region)
+    resp = client.converse(
+        modelId=model,
+        system=[{"text": system}],
+        messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+        inferenceConfig={"temperature": temperature, "maxTokens": max_tokens},
+    )
+    output = resp.get("output", {})
+    message = output.get("message", {})
+    parts = message.get("content", [])
+    return "".join(p.get("text", "") for p in parts)
+
+
+async def _bedrock_chat_async(
+    model: str, system: str, user_prompt: str, *,
+    region: str, temperature: float = 0.4, max_tokens: int = 4096,
+) -> str:
+    return await asyncio.to_thread(
+        _bedrock_chat, model, system, user_prompt,
+        region=region, temperature=temperature, max_tokens=max_tokens,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Anthropic clients (sync + async)
+# ---------------------------------------------------------------------------
 
 def _anthropic_chat(
     model: str, system: str, user_prompt: str, *,
@@ -57,29 +77,6 @@ def _anthropic_chat(
     resp.raise_for_status()
     blocks = resp.json().get("content", [])
     return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-
-
-# ---------------------------------------------------------------------------
-# Async clients  (used for parallel feature execution)
-# ---------------------------------------------------------------------------
-
-async def _ollama_chat_async(
-    model: str, system: str, user_prompt: str, *,
-    base_url: str, temperature: float = 0.4, max_tokens: int = 4096,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        resp = await client.post(f"{base_url}/api/chat", json=payload)
-    resp.raise_for_status()
-    return resp.json().get("message", {}).get("content", "")
 
 
 async def _anthropic_chat_async(
@@ -117,9 +114,9 @@ def call_model(
         0.3 if spec.tier == ModelTier.PAID_SUPERVISOR else 0.4
     )
     log.info(f"  [sync] {spec.provider}:{spec.name} ({spec.tier.value})")
-    if spec.provider == "ollama":
-        return _ollama_chat(spec.name, system_prompt, user_prompt,
-                            base_url=config.ollama_base_url, temperature=temp, max_tokens=max_tokens)
+    if spec.provider == "bedrock":
+        return _bedrock_chat(spec.name, system_prompt, user_prompt,
+                             region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
     elif spec.provider == "anthropic":
         return _anthropic_chat(spec.name, system_prompt, user_prompt,
                                api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
@@ -134,9 +131,9 @@ async def call_model_async(
         0.3 if spec.tier == ModelTier.PAID_SUPERVISOR else 0.4
     )
     log.info(f"  [async] {spec.provider}:{spec.name} ({spec.tier.value})")
-    if spec.provider == "ollama":
-        return await _ollama_chat_async(spec.name, system_prompt, user_prompt,
-                                        base_url=config.ollama_base_url, temperature=temp, max_tokens=max_tokens)
+    if spec.provider == "bedrock":
+        return await _bedrock_chat_async(spec.name, system_prompt, user_prompt,
+                                         region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
     elif spec.provider == "anthropic":
         return await _anthropic_chat_async(spec.name, system_prompt, user_prompt,
                                            api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
