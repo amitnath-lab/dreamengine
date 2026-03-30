@@ -25,6 +25,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from langgraph.checkpoint.sqlite import SqliteSaver
+
 from .agents import list_phases
 from .config import PipelineConfig
 from .graph import DEFAULT_DB_PATH, build_durable_graph
@@ -51,28 +53,35 @@ _lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Shared read-only checkpointer for reading state
+# ---------------------------------------------------------------------------
+
+def _get_reader_saver(db_path: str = DEFAULT_DB_PATH) -> SqliteSaver | None:
+    """Get a SqliteSaver for reading checkpoint state."""
+    if not Path(db_path).exists():
+        return None
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return SqliteSaver(conn)
+
+
+# ---------------------------------------------------------------------------
 # Helpers — read state from checkpoint DB
 # ---------------------------------------------------------------------------
 
 def _read_checkpoint_state(run_id: str, db_path: str = DEFAULT_DB_PATH) -> dict | None:
-    """Read the latest checkpoint state for a run from SQLite."""
-    if not Path(db_path).exists():
+    """Read the latest checkpoint state for a run using LangGraph's deserializer."""
+    saver = _get_reader_saver(db_path)
+    if not saver:
         return None
-    conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute(
-            "SELECT checkpoint FROM checkpoints WHERE thread_id = ? "
-            "ORDER BY checkpoint_id DESC LIMIT 1",
-            (run_id,),
-        ).fetchone()
-        if not row:
+        config = {"configurable": {"thread_id": run_id}}
+        tup = saver.get_tuple(config)
+        if not tup:
             return None
-        data = json.loads(row[0])
-        return data.get("channel_values", {})
-    except Exception:
+        return tup.checkpoint.get("channel_values", {})
+    except Exception as e:
+        log.warning(f"Failed to read checkpoint for {run_id}: {e}")
         return None
-    finally:
-        conn.close()
 
 
 def _get_effective_run_id(run_id: str) -> str:
@@ -85,49 +94,42 @@ def _get_all_runs(db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     """List all runs from the checkpoint database."""
     if not Path(db_path).exists():
         return []
-    conn = sqlite3.connect(db_path)
+    # Get thread IDs via raw SQL (fast), then read state via SqliteSaver
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
         rows = conn.execute(
             "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
         ).fetchall()
-        runs = []
-        for (thread_id,) in rows:
-            latest = conn.execute(
-                "SELECT checkpoint FROM checkpoints WHERE thread_id = ? "
-                "ORDER BY checkpoint_id DESC LIMIT 1",
-                (thread_id,),
-            ).fetchone()
-            status = "unknown"
-            phase = "?"
-            brief_preview = ""
-            if latest and latest[0]:
-                try:
-                    data = json.loads(latest[0])
-                    channel = data.get("channel_values", {})
-                    phase = channel.get("current_phase", "?")
-                    brief_preview = channel.get("project_brief", "")[:100]
-                    halt_reason = channel.get("halt_reason", "")
-                    if halt_reason.startswith("AWAITING_APPROVAL:"):
-                        status = "AWAITING_APPROVAL"
-                    elif halt_reason.startswith("GATE_FAILED:"):
-                        status = "GATE_FAILED"
-                    elif channel.get("should_halt"):
-                        status = "HALTED"
-                    elif phase == "operate" and not channel.get("should_halt"):
-                        status = "COMPLETED"
-                    else:
-                        status = "IN_PROGRESS"
-                except Exception:
-                    pass
-            runs.append({
-                "run_id": thread_id,
-                "status": status,
-                "current_phase": phase,
-                "brief_preview": brief_preview,
-            })
-        return runs
     finally:
         conn.close()
+
+    runs = []
+    for (thread_id,) in rows:
+        state = _read_checkpoint_state(thread_id, db_path)
+        status = "unknown"
+        phase = "?"
+        brief_preview = ""
+        if state:
+            phase = state.get("current_phase", "?")
+            brief_preview = state.get("project_brief", "")[:100]
+            halt_reason = state.get("halt_reason", "")
+            if halt_reason.startswith("AWAITING_APPROVAL:"):
+                status = "AWAITING_APPROVAL"
+            elif halt_reason.startswith("GATE_FAILED:"):
+                status = "GATE_FAILED"
+            elif state.get("should_halt"):
+                status = "HALTED"
+            elif phase == "operate" and not state.get("should_halt"):
+                status = "COMPLETED"
+            else:
+                status = "IN_PROGRESS"
+        runs.append({
+            "run_id": thread_id,
+            "status": status,
+            "current_phase": phase,
+            "brief_preview": brief_preview,
+        })
+    return runs
 
 
 def _state_to_response(state: dict) -> dict:
@@ -420,7 +422,7 @@ async def stream_run(run_id: str, request: Request):
     """SSE stream — polls checkpoint DB and emits state updates."""
 
     async def event_generator():
-        last_checkpoint_id = None
+        last_sig = None
         while True:
             if await request.is_disconnected():
                 break
@@ -438,10 +440,31 @@ async def stream_run(run_id: str, request: Request):
                     state.get("halt_reason", ""),
                     effective_id,
                 )
-                if sig != last_checkpoint_id:
-                    last_checkpoint_id = sig
+                if sig != last_sig:
+                    last_sig = sig
                     payload = json.dumps(_state_to_response(state))
                     yield f"data: {payload}\n\n"
+            else:
+                # No checkpoint yet — send a waiting status so the UI knows we're connected
+                if last_sig is None:
+                    waiting = json.dumps({
+                        "run_id": effective_id,
+                        "project_brief": "",
+                        "phases": list_phases(),
+                        "phase_statuses": {p: "pending" for p in list_phases()},
+                        "current_phase": "",
+                        "completed_phases": [],
+                        "features": [],
+                        "results_grouped": {},
+                        "verdicts_grouped": {},
+                        "messages": ["Pipeline starting..."],
+                        "should_halt": False,
+                        "halt_reason": "",
+                        "total_results": 0,
+                        "total_verdicts": 0,
+                    })
+                    yield f"data: {waiting}\n\n"
+                    last_sig = "waiting"
 
             await asyncio.sleep(2)
 
