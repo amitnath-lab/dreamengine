@@ -86,6 +86,10 @@ class PipelineState(TypedDict, total=False):
     should_halt: bool
     halt_reason: str
 
+    # --- Resume escalation ---
+    # Feature IDs whose last gate failed; phase nodes use a higher model tier for these
+    retry_features: list[str]
+
 
 def new_run_id() -> str:
     """Generate a short, human-readable run ID."""

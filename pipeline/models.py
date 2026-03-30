@@ -5,8 +5,11 @@ Unified model client – sync + async – talks to AWS Bedrock and Anthropic.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import boto3
@@ -15,6 +18,57 @@ import httpx
 from .config import ModelSpec, ModelTier, PipelineConfig
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Trace logging — writes every call to a JSONL file for inspection
+# ---------------------------------------------------------------------------
+
+_trace_path: str | None = None
+
+
+def set_trace_path(path: str) -> None:
+    global _trace_path
+    _trace_path = path
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # Write a header entry so the file is easy to identify
+    _write_trace({"_event": "session_start", "trace_file": path})
+
+
+def _write_trace(entry: dict) -> None:
+    if not _trace_path:
+        return
+    entry.setdefault("ts", time.time())
+    try:
+        with open(_trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # never let tracing break the pipeline
+
+
+def _trace_call(
+    *,
+    provider: str,
+    model: str,
+    tier: str,
+    system: str,
+    user: str,
+    response: str,
+    duration_s: float,
+    context: str = "",
+) -> None:
+    _write_trace({
+        "provider": provider,
+        "model": model,
+        "tier": tier,
+        "context": context,
+        "system_chars": len(system),
+        "user_chars": len(user),
+        "response_chars": len(response),
+        "duration_s": round(duration_s, 3),
+        "system": system,
+        "user": user,
+        "response": response,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -108,36 +162,50 @@ async def _anthropic_chat_async(
 
 def call_model(
     spec: ModelSpec, system_prompt: str, user_prompt: str,
-    config: PipelineConfig, *, temperature: float | None = None, max_tokens: int = 4096,
+    config: PipelineConfig, *, temperature: float | None = None,
+    max_tokens: int = 4096, context: str = "",
 ) -> str:
     temp = temperature if temperature is not None else (
         0.3 if spec.tier == ModelTier.PAID_SUPERVISOR else 0.4
     )
     log.info(f"  [sync] {spec.provider}:{spec.name} ({spec.tier.value})")
+    t0 = time.monotonic()
     if spec.provider == "bedrock":
-        return _bedrock_chat(spec.name, system_prompt, user_prompt,
-                             region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
+        result = _bedrock_chat(spec.name, system_prompt, user_prompt,
+                               region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
     elif spec.provider == "anthropic":
-        return _anthropic_chat(spec.name, system_prompt, user_prompt,
-                               api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
-    raise ValueError(f"Unknown provider: {spec.provider}")
+        result = _anthropic_chat(spec.name, system_prompt, user_prompt,
+                                 api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
+    else:
+        raise ValueError(f"Unknown provider: {spec.provider}")
+    _trace_call(provider=spec.provider, model=spec.name, tier=spec.tier.value,
+                system=system_prompt, user=user_prompt, response=result,
+                duration_s=time.monotonic() - t0, context=context)
+    return result
 
 
 async def call_model_async(
     spec: ModelSpec, system_prompt: str, user_prompt: str,
-    config: PipelineConfig, *, temperature: float | None = None, max_tokens: int = 4096,
+    config: PipelineConfig, *, temperature: float | None = None,
+    max_tokens: int = 4096, context: str = "",
 ) -> str:
     temp = temperature if temperature is not None else (
         0.3 if spec.tier == ModelTier.PAID_SUPERVISOR else 0.4
     )
     log.info(f"  [async] {spec.provider}:{spec.name} ({spec.tier.value})")
+    t0 = time.monotonic()
     if spec.provider == "bedrock":
-        return await _bedrock_chat_async(spec.name, system_prompt, user_prompt,
-                                         region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
+        result = await _bedrock_chat_async(spec.name, system_prompt, user_prompt,
+                                           region=config.aws_bedrock_region, temperature=temp, max_tokens=max_tokens)
     elif spec.provider == "anthropic":
-        return await _anthropic_chat_async(spec.name, system_prompt, user_prompt,
-                                           api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
-    raise ValueError(f"Unknown provider: {spec.provider}")
+        result = await _anthropic_chat_async(spec.name, system_prompt, user_prompt,
+                                             api_key=config.anthropic_api_key, temperature=temp, max_tokens=max_tokens)
+    else:
+        raise ValueError(f"Unknown provider: {spec.provider}")
+    _trace_call(provider=spec.provider, model=spec.name, tier=spec.tier.value,
+                system=system_prompt, user=user_prompt, response=result,
+                duration_s=time.monotonic() - t0, context=context)
+    return result
 
 
 # ---------------------------------------------------------------------------

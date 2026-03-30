@@ -45,6 +45,7 @@ if REPO_ROOT not in sys.path:
 from pipeline.agents import PHASE_AGENTS, load_all_agents
 from pipeline.config import DEFAULT_MODELS, PipelineConfig
 from pipeline.graph import DEFAULT_DB_PATH, build_durable_graph, get_checkpointer
+from pipeline.models import set_trace_path
 from pipeline.state import PipelineState, make_initial_state, new_run_id
 
 log = logging.getLogger(__name__)
@@ -228,8 +229,12 @@ def run_pipeline(
 
     thread_config = {"configurable": {"thread_id": rid}}
 
+    trace = str(Path(db_path).parent / f"trace-{rid}.jsonl")
+    set_trace_path(trace)
+
     print(f"\n  Run ID: {rid}")
     print(f"  Database: {db_path}")
+    print(f"  Trace:    {trace}")
     print(f"  Resume with: python -m pipeline --resume {rid}\n")
 
     final = graph.invoke(initial, config=thread_config)
@@ -241,17 +246,79 @@ def resume_pipeline(
     config: PipelineConfig,
     db_path: str = DEFAULT_DB_PATH,
 ) -> dict:
-    """Resume a previously halted or crashed run."""
+    """Resume a previously halted or crashed run.
+
+    Loads the last checkpoint, strips results and verdicts for any failed
+    feature+phase combos, then starts a fresh invocation so those features
+    are re-executed while all passing work is reused.
+    """
     graph, checkpointer = build_durable_graph(config, db_path)
     thread_config = {"configurable": {"thread_id": run_id}}
 
-    # Reset halt flag so the pipeline can continue
-    graph.update_state(thread_config, {"should_halt": False, "halt_reason": ""})
+    # Read the saved state
+    snapshot = graph.get_state(thread_config)
+    if not snapshot or not snapshot.values:
+        print(f"  No checkpoint found for run '{run_id}'.")
+        sys.exit(1)
 
+    state = dict(snapshot.values)
+
+    # Identify failed gate combos (phase, feature_id)
+    failed_combos: set[tuple[str, str]] = {
+        (v["phase"], v["feature_id"])
+        for v in state.get("gate_verdicts", [])
+        if not v.get("passed")
+    }
+
+    if not failed_combos:
+        print(f"  No failed gates in run '{run_id}' — nothing to re-run.")
+        sys.exit(0)
+
+    failed_phases = {phase for phase, _ in failed_combos}
     print(f"\n  Resuming run: {run_id}")
-    print(f"  Database: {db_path}\n")
+    print(f"  Database: {db_path}")
+    print(f"  Re-running: {', '.join(f'{p}/{fid}' for p, fid in sorted(failed_combos))}\n")
 
-    final = graph.invoke(None, config=thread_config)
+    # Strip results and gate verdicts for failed combos
+    clean_results = [
+        r for r in state.get("results", [])
+        if (r.get("phase"), r.get("feature_id")) not in failed_combos
+    ]
+    clean_verdicts = [
+        v for v in state.get("gate_verdicts", [])
+        if (v.get("phase"), v.get("feature_id")) not in failed_combos
+    ]
+    # Remove failed phases from completed_phases so their gates re-evaluate
+    clean_phases = [p for p in state.get("completed_phases", []) if p not in failed_phases]
+
+    retry_feature_ids = [fid for _, fid in failed_combos]
+
+    # Use a new thread_id so operator.add reducers start truly fresh.
+    # Invoking on the old thread would *accumulate* results/messages/verdicts
+    # on top of the existing checkpoint rather than replacing them.
+    continuation_id = new_run_id()
+    new_thread_config = {"configurable": {"thread_id": continuation_id}}
+
+    clean_state = {
+        **state,
+        "run_id": continuation_id,
+        "results": clean_results,
+        "gate_verdicts": clean_verdicts,
+        "completed_phases": clean_phases,
+        "should_halt": False,
+        "halt_reason": "",
+        "messages": [],
+        "retry_features": retry_feature_ids,
+    }
+
+    trace = str(Path(db_path).parent / f"trace-{continuation_id}.jsonl")
+    set_trace_path(trace)
+
+    print(f"  Continuation ID: {continuation_id}")
+    print(f"  Trace:    {trace}")
+    print(f"  Resume next time with: python -m pipeline --resume {continuation_id}\n")
+
+    final = graph.invoke(clean_state, config=new_thread_config)
     return final
 
 
@@ -267,8 +334,13 @@ def print_report(state: dict) -> None:
     for msg in state.get("messages", []):
         print(f"  {msg}")
 
-    print("\n  QUALITY GATES:")
+    # Deduplicate: keep the last verdict per (phase, feature_id) — resumes append new ones
+    seen_verdicts: dict[tuple[str, str], dict] = {}
     for v in state.get("gate_verdicts", []):
+        key = (v.get("phase", ""), v.get("feature_id", ""))
+        seen_verdicts[key] = v
+    print("\n  QUALITY GATES:")
+    for v in seen_verdicts.values():
         icon = "PASS" if v["passed"] else "FAIL"
         fid = v.get("feature_id", "?")
         print(f"    [{icon}] {v['phase']:12s} / {fid:20s}  {v['reason']}")

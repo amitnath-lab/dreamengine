@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 from .agents import AgentSpec, agents_for_phase, load_all_agents
-from .config import PipelineConfig
+from .config import ModelTier, PipelineConfig
 from .models import call_model, call_model_async
 from .state import AgentResult, Feature, PipelineState
 from .supervisor import (
@@ -43,6 +43,11 @@ def _get_registry(repo_root: str):
 
 def make_decompose_node(config: PipelineConfig):
     def decompose(state: PipelineState) -> dict[str, Any]:
+        # Idempotent: skip if features were pre-populated (e.g. on resume)
+        if state.get("features"):
+            log.info("  [cached] Features already decomposed — skipping")
+            return {"messages": ["  [cached] Features already decomposed — skipping"]}
+
         log.info("\n" + "=" * 60)
         log.info("  SUPERVISOR: Decomposing project into features")
         log.info("=" * 60)
@@ -113,7 +118,13 @@ async def _execute_feature_phase(
                 messages.append(f"    [{feature['id']}] Agent '{agent_name}' not found - skipped")
                 continue
 
-            model_spec = select_model_for_task(agent_name, rec_tier, config)
+            # Escalate to free_medium for features retried after a gate failure
+            retry_features = state.get("retry_features") or []
+            if feature["id"] in retry_features:
+                effective_tier = ModelTier.FREE_MEDIUM.value
+            else:
+                effective_tier = rec_tier
+            model_spec = select_model_for_task(agent_name, effective_tier, config)
 
             system_prompt = (
                 f"You are the {agent_spec.name} agent.\n"
@@ -191,11 +202,20 @@ def make_phase_node(phase: str, config: PipelineConfig):
             if v.get("passed"):
                 done_features.add(v.get("feature_id", ""))
 
+        # Features that already have results for this phase (idempotency on resume)
+        already_done_ids = {
+            r.get("feature_id")
+            for r in state.get("results", [])
+            if r.get("phase") == phase
+        }
+
         ready_features = []
         deferred_features = []
         for f in features:
             if f.get("status") == "done":
                 continue
+            if f["id"] in already_done_ids:
+                continue  # results already exist for this feature+phase
             deps = f.get("depends_on", [])
             if all(d in done_features or d == f["id"] for d in deps):
                 ready_features.append(f)
@@ -254,6 +274,20 @@ def make_gate_node(phase: str, config: PipelineConfig):
                 if r.get("phase") == phase and r.get("feature_id") == feature["id"]
             ]
             if not phase_results:
+                continue
+
+            # Reuse an existing passing verdict (idempotency on resume)
+            existing_verdict = next(
+                (v for v in state.get("gate_verdicts", [])
+                 if v.get("phase") == phase and v.get("feature_id") == feature["id"]
+                 and v.get("passed")),
+                None,
+            )
+            if existing_verdict:
+                verdicts.append(existing_verdict)
+                msg = f"  [cached] Gate [{phase}/{feature['id']}]: {existing_verdict['reason']}"
+                messages.append(msg)
+                log.info(msg)
                 continue
 
             verdict = quality_gate(state, phase, feature, config)

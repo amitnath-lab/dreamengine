@@ -105,7 +105,8 @@ Return a JSON array:
 Order by priority (1 = highest).  Features with no dependencies can be built
 in parallel.  Return ONLY the JSON array."""
 
-    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=4096)
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config,
+                     max_tokens=4096, context="decompose_features")
 
     try:
         items = _parse_json(raw)
@@ -183,7 +184,8 @@ Produce a JSON array of tasks.  Each element:
 
 Prioritise free_fast.  Return ONLY the JSON array."""
 
-    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=4096)
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config,
+                     max_tokens=4096, context=f"plan_phase/{phase}/{feature['id']}")
 
     try:
         plan = _parse_json(raw)
@@ -229,7 +231,8 @@ Review and decide pass/fail.  Reply with JSON:
 {{"passed": true|false, "reason": "<1-2 sentences>"}}
 Return ONLY the JSON object."""
 
-    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config, max_tokens=512)
+    raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config,
+                     max_tokens=512, context=f"quality_gate/{phase}/{feature['id']}")
 
     try:
         verdict = _parse_json(raw)
