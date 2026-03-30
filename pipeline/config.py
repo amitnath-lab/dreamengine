@@ -75,7 +75,7 @@ DEFAULT_MODELS: list[ModelSpec] = [
 
     # --- Medium (higher quality, moderate cost) ---
     ModelSpec(
-        name="anthropic.claude-3-5-haiku-20241022-v1:0",
+        name="us.anthropic.claude-3-5-haiku-20241022-v1:0",
         tier=ModelTier.FREE_MEDIUM,
         provider="bedrock",
         context_window=200000,

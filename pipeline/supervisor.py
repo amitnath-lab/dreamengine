@@ -182,6 +182,11 @@ Produce a JSON array of tasks.  Each element:
   "parallel_group": <int>
 }}
 
+IMPORTANT: Each agent must appear AT MOST ONCE in the plan.  Do NOT assign
+multiple tasks to the same agent — combine related work into a single task
+instruction instead.  Select only the agents that are truly needed; you do
+NOT have to use every available agent.
+
 Prioritise free_fast.  Return ONLY the JSON array."""
 
     raw = call_model(supervisor, SUPERVISOR_SYSTEM, prompt, config,
@@ -196,7 +201,18 @@ Prioritise free_fast.  Return ONLY the JSON array."""
              "recommended_tier": "free_fast", "parallel_group": 0}
             for a in available_agents[:5]  # cap to avoid overwhelming
         ]
-    return plan
+
+    # Deduplicate: keep only the first task per agent
+    seen_agents: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for task_def in plan:
+        agent = task_def.get("agent", "")
+        if agent not in seen_agents:
+            seen_agents.add(agent)
+            deduped.append(task_def)
+        else:
+            log.info(f"  Dropping duplicate task for agent '{agent}' in {phase}/{feature['id']}")
+    return deduped
 
 
 # ---------------------------------------------------------------------------
