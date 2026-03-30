@@ -301,12 +301,21 @@ def make_gate_node(phase: str, config: PipelineConfig):
             if not verdict["passed"]:
                 any_failed = True
 
+        pause = getattr(config, "pause_for_approval", False)
+        should_halt = any_failed or pause
+        if any_failed:
+            halt_reason = f"GATE_FAILED: Quality gate failed for phase: {phase}"
+        elif pause:
+            halt_reason = f"AWAITING_APPROVAL: Phase {phase} complete — waiting for user approval"
+        else:
+            halt_reason = ""
+
         return {
             "gate_verdicts": verdicts,
             "messages": messages,
             "completed_phases": [phase] if not any_failed else [],
-            "should_halt": any_failed,
-            "halt_reason": f"Quality gate failed for phase: {phase}" if any_failed else "",
+            "should_halt": should_halt,
+            "halt_reason": halt_reason,
         }
 
     gate_node.__name__ = f"gate_{phase}"

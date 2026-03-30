@@ -271,3 +271,4 @@ class PipelineConfig:
     agent_specs_root: str = ""  # set to repo root at startup
     max_retries: int = 3
     verbose: bool = False
+    pause_for_approval: bool = False  # when True, halt after every gate for user approval
